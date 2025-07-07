@@ -1,0 +1,286 @@
+# Create Data Prepper configuration as alternative to Logstash
+data_prepper_config = '''# Wazuh to OCSF Transformation Pipeline - Data Prepper Configuration
+# File: data-prepper-pipelines.yaml
+
+wazuh-to-ocsf-pipeline:
+  workers: 4
+  delay: 5000
+  
+  source:
+    opensearch:
+      hosts:
+        - "${WAZUH_INDEXER_HOST:localhost:9200}"
+      username: "${WAZUH_INDEXER_USER:admin}"
+      password: "${WAZUH_INDEXER_PASSWORD:admin}"
+      indices:
+        include:
+          - "wazuh-alerts-*"
+          - "wazuh-archives-*"
+      search:
+        query:
+          range:
+            timestamp:
+              gte: "now-5m"
+        batch_size: 1000
+      scheduling:
+        interval: "PT5M"  # Every 5 minutes
+      ssl:
+        insecure: false
+        certificate_path: "/usr/share/data-prepper/certs/root-ca.pem"
+  
+  buffer:
+    bounded_blocking:
+      buffer_size: 10240
+      batch_size: 512
+  
+  processor:
+    # Validate Wazuh event structure
+    - delete_entries:
+        with_keys:
+          - "message"
+        when: '/timestamp == null or /rule == null or /agent == null'
+    
+    # Add OCSF base event fields
+    - add_entries:
+        entries:
+          - key: "activity_id"
+            value: 1
+          - key: "activity_name" 
+            value: "Create"
+          - key: "category_uid"
+            value: 2
+          - key: "category_name"
+            value: "Findings"
+          - key: "class_uid"
+            value: 2004
+          - key: "class_name"
+            value: "Detection Finding"
+          - key: "type_uid"
+            value: 200401
+          - key: "type_name"
+            value: "Detection Finding: Create"
+    
+    # Parse and convert timestamp
+    - date:
+        from_time_received: false
+        match:
+          - key: "timestamp"
+            patterns: ["yyyy-MM-dd'T'HH:mm:ss.SSSX"]
+        destination: "@timestamp"
+    
+    # Convert timestamp to OCSF time (epoch milliseconds)
+    - mutate_event:
+        entries:
+          - set:
+              time: '/timestamp'
+              format: "epoch_milli"
+    
+    # Map Wazuh severity to OCSF severity
+    - mutate_event:
+        entries:
+          - set:
+              severity_id: >
+                if /rule/level <= 3 then 1
+                elif /rule/level <= 6 then 2  
+                elif /rule/level <= 9 then 3
+                elif /rule/level <= 12 then 4
+                elif /rule/level <= 15 then 5
+                else 6 end
+          - set:
+              severity: >
+                if /rule/level <= 3 then "Informational"
+                elif /rule/level <= 6 then "Low"
+                elif /rule/level <= 9 then "Medium" 
+                elif /rule/level <= 12 then "High"
+                elif /rule/level <= 15 then "Critical"
+                else "Fatal" end
+    
+    # Build finding object
+    - mutate_event:
+        entries:
+          - set:
+              finding/created_time: '/time'
+              finding/first_seen_time: '/time'
+              finding/last_seen_time: '/time'
+              finding/modified_time: '/time'
+              finding/title: '/rule/description'
+              finding/desc: '/rule/description'
+              finding/uid: '/id'
+              finding/product_uid: '/manager/name'
+              finding/types: ["Security Control"]
+    
+    # Build metadata object
+    - mutate_event:
+        entries:
+          - set:
+              metadata/event_code: '/rule/id'
+              metadata/version: "1.1.0"
+              metadata/product/name: "Wazuh"
+              metadata/product/vendor_name: "Wazuh Inc" 
+              metadata/product/version: "4.8.0"
+              metadata/product/uid: "wazuh-4.x"
+              metadata/profiles: ["security_control"]
+    
+    # Set message field
+    - mutate_event:
+        entries:
+          - set:
+              message: '/rule/description'
+    
+    # Build observables array for network events
+    - mutate_event:
+        entries:
+          - set:
+              observables: >
+                [
+                  if /data/srcip != null then {
+                    "name": "src_endpoint.ip",
+                    "type": "IP Address",
+                    "type_id": 2,
+                    "value": /data/srcip
+                  } else null end,
+                  if /data/dstip != null then {
+                    "name": "dst_endpoint.ip", 
+                    "type": "IP Address",
+                    "type_id": 2,
+                    "value": /data/dstip
+                  } else null end,
+                  if /syscheck/path != null then {
+                    "name": "file.path",
+                    "type": "File Name", 
+                    "type_id": 7,
+                    "value": /syscheck/path
+                  } else null end,
+                  if /data/command != null then {
+                    "name": "process.cmd_line",
+                    "type": "Command Line",
+                    "type_id": 6, 
+                    "value": /data/command
+                  } else null end
+                ] | map(select(. != null))
+        when: '/data/srcip != null or /data/dstip != null or /syscheck/path != null or /data/command != null'
+    
+    # Preserve original data as raw_data  
+    - mutate_event:
+        entries:
+          - rename:
+              raw_data: '.'
+    
+    # Build unmapped object for Wazuh-specific fields
+    - mutate_event:
+        entries:
+          - set:
+              unmapped/wazuh_rule_groups: '/raw_data/rule/groups'
+              unmapped/wazuh_location: '/raw_data/location' 
+              unmapped/wazuh_decoder: '/raw_data/decoder/name'
+              unmapped/wazuh_cluster: '/raw_data/cluster/name'
+    
+    # Convert raw_data to JSON string
+    - json_converter:
+        source: "raw_data"
+        target: "raw_data"
+    
+    # Remove temporary fields
+    - delete_entries:
+        with_keys:
+          - "timestamp"
+          - "@timestamp"
+          - "host"
+          - "log"
+    
+    # Tag valid events
+    - mutate_event:
+        entries:
+          - add:
+              tags: ["ocsf_valid"]
+        when: '/activity_id != null and /category_uid != null and /class_uid != null and /severity_id != null and /time != null'
+
+  sink:
+    # Primary output to OpenSearch
+    - opensearch:
+        hosts:
+          - "${OUTPUT_OPENSEARCH_HOST:localhost:9200}"
+        username: "${OUTPUT_OPENSEARCH_USER:admin}"
+        password: "${OUTPUT_OPENSEARCH_PASSWORD:admin}"
+        index_type: "custom"
+        index: "ocsf-security-events-%{yyyy.MM.dd}"
+        template_file: "/usr/share/data-prepper/templates/ocsf-template.json"
+        ssl:
+          insecure: false
+          certificate_path: "/usr/share/data-prepper/certs/root-ca.pem"
+        retry_count: 3
+        retry_backoff: "PT5S"
+        when: '"ocsf_valid" in getTags()'
+    
+    # Secondary output for failed validations
+    - opensearch:
+        hosts:
+          - "${OUTPUT_OPENSEARCH_HOST:localhost:9200}"
+        index: "ocsf-validation-errors-%{yyyy.MM.dd}"
+        when: '"ocsf_valid" not in getTags()'
+    
+    # File output for backup
+    - file:
+        path: "/opt/data-prepper/output/ocsf-events-%{yyyy-MM-dd}.json"
+        when: '"ocsf_valid" in getTags()'
+
+# Additional pipeline for real-time file monitoring
+wazuh-file-monitor-pipeline:
+  workers: 2
+  delay: 1000
+  
+  source:
+    file:
+      path: "/var/ossec/logs/alerts/alerts.json"
+      format: "json"
+      record_type: "event"
+  
+  processor:
+    # Parse JSON events
+    - parse_json:
+        source: "message"
+        destination: "wazuh_event"
+    
+    # Apply same transformations as main pipeline
+    # (abbreviated for brevity - would include same processors)
+    - add_entries:
+        entries:
+          - key: "source_pipeline"
+            value: "file_monitor"
+  
+  sink:
+    # Route to main pipeline for processing
+    - pipeline:
+        name: "wazuh-to-ocsf-pipeline"
+
+# Performance monitoring pipeline  
+performance-metrics-pipeline:
+  workers: 1
+  delay: 60000  # 1 minute
+  
+  source:
+    pipeline_metrics:
+      pipelines: ["wazuh-to-ocsf-pipeline", "wazuh-file-monitor-pipeline"]
+  
+  processor:
+    - mutate_event:
+        entries:
+          - add:
+              metric_type: "pipeline_performance"
+              timestamp: "${timestamp}"
+  
+  sink:
+    - opensearch:
+        hosts:
+          - "${METRICS_OPENSEARCH_HOST:localhost:9200}"
+        index: "data-prepper-metrics-%{yyyy.MM.dd}"'''
+
+# Save Data Prepper configuration  
+with open('data-prepper-pipelines.yaml', 'w') as f:
+    f.write(data_prepper_config)
+
+print("Data Prepper Pipeline Configuration Created:")
+print("=" * 50)
+print("File: data-prepper-pipelines.yaml")
+print(f"Configuration length: {len(data_prepper_config)} characters")
+print(f"Lines of configuration: {len(data_prepper_config.splitlines())}")

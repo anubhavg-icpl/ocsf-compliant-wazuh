@@ -1,0 +1,337 @@
+# Create example Logstash pipeline configuration
+logstash_config = '''# Wazuh to OCSF Transformation Pipeline Configuration
+# File: wazuh-ocsf-pipeline.conf
+
+input {
+  # Option 1: Read from Elasticsearch/OpenSearch indices
+  opensearch {
+    hosts => ["${WAZUH_INDEXER_HOST:localhost:9200}"]
+    user => "${WAZUH_INDEXER_USER:admin}"
+    password => "${WAZUH_INDEXER_PASSWORD:admin}"
+    index => "wazuh-alerts-*,wazuh-archives-*"
+    query => '{
+      "query": {
+        "range": {
+          "timestamp": {
+            "gte": "now-1h"
+          }
+        }
+      }
+    }'
+    schedule => "*/5 * * * *"  # Every 5 minutes
+    ssl => true
+    ssl_certificate_verification => false
+    ca_file => "/etc/logstash/certs/root-ca.pem"
+    tags => ["wazuh_source"]
+  }
+  
+  # Option 2: Read from files
+  file {
+    path => ["/var/ossec/logs/alerts/alerts.json"]
+    start_position => "end"
+    sincedb_path => "/opt/logstash/sincedb_wazuh_alerts"
+    tags => ["wazuh_file_source"]
+  }
+}
+
+filter {
+  # Parse JSON if coming from file input
+  if "wazuh_file_source" in [tags] {
+    json {
+      source => "message"
+      target => "wazuh_event"
+    }
+  } else {
+    mutate {
+      rename => { "" => "wazuh_event" }
+    }
+  }
+  
+  # Validate input against Wazuh schema
+  ruby {
+    code => '
+      required_fields = ["timestamp", "rule", "agent"]
+      missing_fields = required_fields.select { |field| 
+        event.get("[wazuh_event][#{field}]").nil? 
+      }
+      if !missing_fields.empty?
+        event.set("validation_errors", missing_fields)
+        event.tag("_wazuh_validation_failed")
+      end
+    '
+  }
+  
+  # Drop invalid events
+  if "_wazuh_validation_failed" in [tags] {
+    drop { }
+  }
+  
+  # Transform to OCSF Base Event fields
+  mutate {
+    # Required OCSF fields
+    add_field => {
+      "activity_id" => "1"
+      "activity_name" => "Create"
+      "category_uid" => "2"
+      "category_name" => "Findings"
+      "class_uid" => "2004"
+      "class_name" => "Detection Finding"
+      "type_uid" => "200401"
+      "type_name" => "Detection Finding: Create"
+    }
+  }
+  
+  # Map Wazuh timestamp to OCSF time
+  date {
+    match => [ "[wazuh_event][timestamp]", "ISO8601" ]
+    target => "@timestamp"
+  }
+  
+  ruby {
+    code => 'event.set("time", (event.get("@timestamp").to_f * 1000).to_i)'
+  }
+  
+  # Map severity
+  ruby {
+    code => '
+      wazuh_level = event.get("[wazuh_event][rule][level]").to_i
+      severity_mapping = {
+        (0..3) => [1, "Informational"],
+        (4..6) => [2, "Low"], 
+        (7..9) => [3, "Medium"],
+        (10..12) => [4, "High"],
+        (13..15) => [5, "Critical"],
+        (16..16) => [6, "Fatal"]
+      }
+      
+      severity_mapping.each do |range, (id, name)|
+        if range.include?(wazuh_level)
+          event.set("severity_id", id)
+          event.set("severity", name)
+          break
+        end
+      end
+    '
+  }
+  
+  # Build Finding object
+  ruby {
+    code => '
+      finding = {
+        "created_time" => event.get("time"),
+        "first_seen_time" => event.get("time"),
+        "last_seen_time" => event.get("time"),
+        "modified_time" => event.get("time"),
+        "title" => event.get("[wazuh_event][rule][description]") || "Wazuh Security Alert",
+        "desc" => event.get("[wazuh_event][rule][description]") || "Security event detected by Wazuh",
+        "uid" => "#{event.get("[wazuh_event][id]") || Time.now.to_f}",
+        "product_uid" => event.get("[wazuh_event][manager][name]") || "wazuh-manager",
+        "types" => ["Security Control"]
+      }
+      
+      # Add MITRE ATT&CK data if available
+      if !event.get("[wazuh_event][rule][mitre]").nil?
+        mitre_data = event.get("[wazuh_event][rule][mitre]")
+        attack = []
+        
+        if mitre_data.is_a?(Array)
+          mitre_data.each do |mitre|
+            attack_item = {}
+            if mitre["id"]
+              attack_item["technique"] = {
+                "uid" => mitre["id"][0],
+                "name" => mitre["technique"] || mitre["id"][0]
+              }
+            end
+            if mitre["tactic"]
+              attack_item["tactics"] = mitre["tactic"].map { |t| {"name" => t} }
+            end
+            attack << attack_item unless attack_item.empty?
+          end
+        end
+        
+        finding["attack"] = attack unless attack.empty?
+      end
+      
+      # Add related events
+      finding["related_events"] = [{"uid" => event.get("[wazuh_event][id]") || "unknown"}]
+      
+      event.set("finding", finding)
+    '
+  }
+  
+  # Build metadata object
+  mutate {
+    add_field => {
+      "[metadata][event_code]" => "%{[wazuh_event][rule][id]}"
+      "[metadata][version]" => "1.1.0"
+      "[metadata][product][name]" => "Wazuh"
+      "[metadata][product][vendor_name]" => "Wazuh Inc"
+      "[metadata][product][version]" => "4.8.0"
+      "[metadata][product][uid]" => "wazuh-4.x"
+      "[metadata][profiles]" => "security_control"
+    }
+  }
+  
+  # Set message field
+  mutate {
+    add_field => { "message" => "%{[wazuh_event][rule][description]}" }
+  }
+  
+  # Build observables array
+  ruby {
+    code => '
+      observables = []
+      
+      # Add IP addresses as observables
+      if event.get("[wazuh_event][data][srcip]")
+        observables << {
+          "name" => "src_endpoint.ip",
+          "type" => "IP Address", 
+          "type_id" => 2,
+          "value" => event.get("[wazuh_event][data][srcip]")
+        }
+      end
+      
+      if event.get("[wazuh_event][data][dstip]")
+        observables << {
+          "name" => "dst_endpoint.ip",
+          "type" => "IP Address",
+          "type_id" => 2, 
+          "value" => event.get("[wazuh_event][data][dstip]")
+        }
+      end
+      
+      # Add file paths as observables
+      if event.get("[wazuh_event][syscheck][path]")
+        observables << {
+          "name" => "file.path",
+          "type" => "File Name",
+          "type_id" => 7,
+          "value" => event.get("[wazuh_event][syscheck][path]")
+        }
+      end
+      
+      # Add command lines as observables  
+      if event.get("[wazuh_event][data][command]")
+        observables << {
+          "name" => "process.cmd_line",
+          "type" => "Command Line",
+          "type_id" => 6,
+          "value" => event.get("[wazuh_event][data][command]")
+        }
+      end
+      
+      event.set("observables", observables) unless observables.empty?
+    '
+  }
+  
+  # Preserve original data
+  mutate {
+    rename => { "[wazuh_event]" => "raw_data" }
+  }
+  
+  # Convert raw_data to JSON string
+  ruby {
+    code => 'event.set("raw_data", event.get("raw_data").to_json)'
+  }
+  
+  # Build unmapped object for fields not in OCSF
+  ruby {
+    code => '
+      unmapped = {}
+      
+      # Preserve Wazuh-specific fields
+      raw_data = JSON.parse(event.get("raw_data"))
+      
+      unmapped["wazuh_rule_groups"] = raw_data.dig("rule", "groups") if raw_data.dig("rule", "groups")
+      unmapped["wazuh_location"] = raw_data["location"] if raw_data["location"]
+      unmapped["wazuh_decoder"] = raw_data.dig("decoder", "name") if raw_data.dig("decoder", "name")
+      unmapped["wazuh_cluster"] = raw_data.dig("cluster", "name") if raw_data.dig("cluster", "name")
+      
+      event.set("unmapped", unmapped) unless unmapped.empty?
+    '
+  }
+  
+  # Validate against OCSF schema (simplified)
+  ruby {
+    code => '
+      required_ocsf_fields = ["activity_id", "category_uid", "class_uid", "severity_id", "time"]
+      missing_ocsf = required_ocsf_fields.select { |field| event.get(field).nil? }
+      
+      if !missing_ocsf.empty?
+        event.set("ocsf_validation_errors", missing_ocsf)
+        event.tag("_ocsf_validation_failed")
+      else
+        event.tag("_ocsf_valid")
+      end
+    '
+  }
+  
+  # Clean up temporary fields
+  mutate {
+    remove_field => ["wazuh_event", "@version", "host", "path"]
+  }
+}
+
+output {
+  # Output to Elasticsearch/OpenSearch
+  if "_ocsf_valid" in [tags] {
+    opensearch {
+      hosts => ["${OUTPUT_OPENSEARCH_HOST:localhost:9200}"]
+      user => "${OUTPUT_OPENSEARCH_USER:admin}"
+      password => "${OUTPUT_OPENSEARCH_PASSWORD:admin}"
+      index => "ocsf-security-events-%{+YYYY.MM.dd}"
+      template_name => "ocsf-security-events"
+      template => "/etc/logstash/templates/ocsf-template.json"
+      template_overwrite => true
+      ssl => true
+      ssl_certificate_verification => false
+      ca_file => "/etc/logstash/certs/root-ca.pem"
+    }
+  }
+  
+  # Output validation failures to separate index for troubleshooting
+  if "_ocsf_validation_failed" in [tags] {
+    opensearch {
+      hosts => ["${OUTPUT_OPENSEARCH_HOST:localhost:9200}"]
+      index => "ocsf-validation-errors-%{+YYYY.MM.dd}"
+    }
+  }
+  
+  # Optional: Output to file for backup/archival
+  if "_ocsf_valid" in [tags] {
+    file {
+      path => "/opt/logstash/output/ocsf-events-%{+YYYY.MM.dd}.json"
+      codec => "json_lines"
+    }
+  }
+  
+  # Optional: HTTP output for external SIEM
+  if "_ocsf_valid" in [tags] and "${EXTERNAL_SIEM_ENABLED:false}" == "true" {
+    http {
+      url => "${EXTERNAL_SIEM_URL}"
+      http_method => "post"
+      headers => {
+        "Content-Type" => "application/json"
+        "Authorization" => "Bearer ${EXTERNAL_SIEM_TOKEN}"
+      }
+      mapping => {
+        "event" => "%{[@metadata][ocsf_event]}"
+      }
+      retry_failed => true
+      retries => 3
+      retry_non_idempotent => true
+    }
+  }
+}'''
+
+# Save Logstash configuration
+with open('wazuh-ocsf-pipeline.conf', 'w') as f:
+    f.write(logstash_config)
+
+print("Logstash Pipeline Configuration Created:")
+print("=" * 50)
+print("File: wazuh-ocsf-pipeline.conf")
+print(f"Configuration length: {len(logstash_config)} characters")
+print(f"Lines of configuration: {len(logstash_config.splitlines())}")

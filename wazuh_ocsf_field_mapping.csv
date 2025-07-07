@@ -1,0 +1,26 @@
+Wazuh Field,OCSF Field,OCSF Event Class,Data Type,Required
+rule.id,finding.uid,Detection Finding (2004),String,Yes
+rule.level,severity_id,Base Event,Integer (1-6),Yes
+rule.description,message,Base Event,String,No
+rule.mitre.id,finding.related_events[].uid,Detection Finding (2004),String,No
+rule.mitre.tactic,finding.attack[].tactic.name,Detection Finding (2004),String,No
+agent.id,device.uid,Base Event,String,Yes
+agent.name,device.name,Base Event,String,No
+agent.ip,device.ip,Base Event,String,No
+location,metadata.product.feature.name,Base Event,String,No
+decoder.name,metadata.log_name,Base Event,String,No
+timestamp,time,Base Event,Timestamp,Yes
+full_log,raw_data,Base Event,String,No
+data.srcip,src_endpoint.ip,Network Activity (4001),String,No
+data.dstip,dst_endpoint.ip,Network Activity (4001),String,No
+data.srcport,src_endpoint.port,Network Activity (4001),Integer,No
+data.dstport,dst_endpoint.port,Network Activity (4001),Integer,No
+data.protocol,connection_info.protocol_name,Network Activity (4001),String,No
+data.action,action_id,Base Event,Integer (1-6),Yes
+data.srcuser,actor.user.name,Authentication (3002),String,No
+data.command,process.cmd_line,Process Activity (1007),String,No
+syscheck.path,file.path,File System Activity (1001),String,Yes
+syscheck.size_after,file.size,File System Activity (1001),Integer,No
+syscheck.perm_after,file.attributes,File System Activity (1001),String,No
+syscheck.uid_after,file.owner.uid,File System Activity (1001),String,No
+syscheck.event,activity_id,File System Activity (1001),Integer (1-7),Yes

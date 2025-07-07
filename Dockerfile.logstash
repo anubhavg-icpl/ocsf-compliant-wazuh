@@ -1,0 +1,52 @@
+# Production-ready Wazuh to OCSF Transformation Pipeline
+# Based on Elastic Logstash
+FROM docker.elastic.co/logstash/logstash:8.11.0
+
+# Set environment variables
+ENV LOGSTASH_HOME=/usr/share/logstash
+ENV PATH=$LOGSTASH_HOME/bin:$PATH
+ENV LS_SETTINGS_DIR=$LOGSTASH_HOME/config
+
+# Install required plugins
+RUN logstash-plugin install logstash-input-opensearch
+RUN logstash-plugin install logstash-output-opensearch  
+RUN logstash-plugin install logstash-filter-json_encode
+RUN logstash-plugin install logstash-filter-ruby
+
+# Create directories
+RUN mkdir -p /etc/logstash/conf.d     /etc/logstash/templates     /etc/logstash/certs     /opt/logstash/sincedb     /opt/logstash/output     /var/log/logstash
+
+# Copy pipeline configuration
+COPY wazuh-ocsf-pipeline.conf /etc/logstash/conf.d/
+COPY templates/ /etc/logstash/templates/
+COPY certs/ /etc/logstash/certs/
+
+# Copy Logstash settings
+COPY config/logstash.yml $LS_SETTINGS_DIR/
+COPY config/pipelines.yml $LS_SETTINGS_DIR/
+COPY config/jvm.options $LS_SETTINGS_DIR/
+
+# Set proper permissions
+RUN chown -R logstash:logstash /etc/logstash /opt/logstash /var/log/logstash     && chmod 755 /etc/logstash/certs/*     && chmod 644 /etc/logstash/conf.d/*     && chmod 644 /etc/logstash/templates/*
+
+# Performance and memory optimization
+ENV LS_JAVA_OPTS="-Xmx2g -Xms2g"
+ENV LS_HEAP_SIZE="2g"
+
+# Pipeline configuration
+ENV PIPELINE_WORKERS="4"
+ENV PIPELINE_BATCH_SIZE="1000"
+ENV PIPELINE_BATCH_DELAY="50"
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3   CMD curl -f http://localhost:9600/_node/stats || exit 1
+
+# Expose monitoring port
+EXPOSE 9600
+
+# Switch to logstash user
+USER logstash
+
+# Entry point
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint"]
+CMD ["logstash", "-f", "/etc/logstash/conf.d/wazuh-ocsf-pipeline.conf"]

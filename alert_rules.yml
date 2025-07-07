@@ -1,0 +1,59 @@
+# Alert rules for Wazuh-OCSF pipeline
+# File: monitoring/alert_rules.yml
+
+groups:
+  - name: pipeline_alerts
+    rules:
+      - alert: HighProcessingLatency
+        expr: logstash_pipeline_events_duration_seconds{quantile="0.95"} > 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High processing latency detected"
+          description: "Pipeline latency P95 is {{ $value }}s, above 5s threshold"
+
+      - alert: LowThroughput
+        expr: rate(logstash_pipeline_events_in_total[5m]) < 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low event throughput"
+          description: "Event ingestion rate is {{ $value }} events/sec, below 100 threshold"
+
+      - alert: HighErrorRate
+        expr: rate(logstash_pipeline_events_filtered_total[5m]) / rate(logstash_pipeline_events_in_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate in pipeline"
+          description: "Error rate is {{ $value | humanizePercentage }}, above 5% threshold"
+
+      - alert: PipelineDown
+        expr: up{job="logstash"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Logstash pipeline is down"
+          description: "Logstash instance {{ $labels.instance }} is not responding"
+
+      - alert: HighMemoryUsage
+        expr: (logstash_jvm_memory_heap_used_bytes / logstash_jvm_memory_heap_max_bytes) > 0.85
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High JVM memory usage"
+          description: "JVM heap usage is {{ $value | humanizePercentage }}, above 85% threshold"
+
+      - alert: QueueBacklog
+        expr: logstash_pipeline_events_queue_size > 5000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pipeline queue backlog"
+          description: "Queue size is {{ $value }} events, above 5000 threshold"

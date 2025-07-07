@@ -1,0 +1,36 @@
+# Prometheus configuration for Wazuh-OCSF pipeline monitoring
+# File: monitoring/prometheus.yml
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alert_rules.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+scrape_configs:
+  # Logstash metrics
+  - job_name: 'logstash'
+    static_configs:
+      - targets: ['wazuh-ocsf-logstash:9600']
+    metrics_path: /_node/stats
+    scrape_interval: 10s
+
+  # OpenSearch metrics
+  - job_name: 'opensearch'
+    static_configs:
+      - targets: ['opensearch:9200']
+    metrics_path: /_prometheus/metrics
+    scrape_interval: 30s
+
+  # System metrics
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+    scrape_interval: 15s
