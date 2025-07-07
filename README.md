@@ -1,0 +1,1 @@
+# ocsf-compliant-wazuh
