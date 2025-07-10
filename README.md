@@ -24,7 +24,7 @@ This project extends Wazuh's capabilities to support OCSF, enabling standardized
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/ocsf-compliant-wazuh.git
+git clone https://github.com/anubhavg-icpl/ocsf-compliant-wazuh.git
 cd ocsf-compliant-wazuh
 ```
 
